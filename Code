@@ -1,0 +1,475 @@
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+
+/* ================= WIFI ================= */
+const char* ssid = "ESP32 AMR";
+const char* password = "manshu#27";
+
+IPAddress apIP(192,168,4,1);
+IPAddress netMsk(255,255,255,0);
+
+WebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+
+/* ================= MOTOR PINS ================= */
+// Drive motor
+const int in1 = 26;
+const int in2 = 25;
+const int ena = 13;
+
+// Steering motor
+const int in3 = 33;
+const int in4 = 32;
+const int enb = 14;
+
+/* ================= LED PINS ================= */
+const int LED_BLUE = 27;
+const int LED_RED  = 12;
+
+/* ================= ULTRASONIC ================= */
+const int trigPin = 5;
+const int echoPin = 18;
+bool ultrasonicEnabled = false;
+
+/* ================= POLICE MODE ================= */
+bool policeMode = false;
+unsigned long policeTimer = 0;
+bool policeState = false;
+
+/* ================= PWM ================= */
+int motorSpeed = 255;
+const int STEER_POWER = 255;
+const int pwmFreq = 15000;
+const int pwmRes  = 8;
+
+/* ================= STATE ================= */
+bool driveForward=false, driveBackward=false;
+bool steerLeft=false, steerRight=false;
+
+unsigned long lastUltraCheck = 0;
+long distanceCM = 200;
+
+/* ================= SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(in1,OUTPUT); pinMode(in2,OUTPUT);
+  pinMode(in3,OUTPUT); pinMode(in4,OUTPUT);
+
+  pinMode(LED_BLUE,OUTPUT);
+  pinMode(LED_RED,OUTPUT);
+
+  pinMode(trigPin,OUTPUT);
+  pinMode(echoPin,INPUT);
+
+  ledcAttach(ena,pwmFreq,pwmRes);
+  ledcAttach(enb,pwmFreq,pwmRes);
+
+  stopAll();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, netMsk);
+  WiFi.softAP(ssid, password);
+
+  dnsServer.start(DNS_PORT, "*", apIP);
+
+  server.on("/", handleRoot);
+
+  server.on("/generate_204", handleRoot);
+  server.on("/gen_204", handleRoot);
+  server.on("/fwlink", handleRoot);
+  server.on("/hotspot-detect.html", handleRoot);
+
+  server.on("/F_ON", [](){ driveForward=true; driveBackward=false; });
+  server.on("/F_OFF", [](){ driveForward=false; });
+
+  server.on("/B_ON", [](){ driveBackward=true; driveForward=false; });
+  server.on("/B_OFF", [](){ driveBackward=false; });
+
+  server.on("/L_ON", [](){ steerLeft=true; steerRight=false; });
+  server.on("/L_OFF", [](){ steerLeft=false; });
+
+  server.on("/R_ON", [](){ steerRight=true; steerLeft=false; });
+  server.on("/R_OFF", [](){ steerRight=false; });
+
+  server.on("/speed", [](){
+    motorSpeed = constrain(server.arg("val").toInt(),165,255);
+  });
+
+  server.on("/ultraOn", [](){ ultrasonicEnabled=true; });
+  server.on("/ultraOff", [](){ ultrasonicEnabled=false; });
+
+  server.on("/policeOn", [](){ policeMode=true; });
+  server.on("/policeOff", [](){ policeMode=false; });
+
+  server.onNotFound(handleRoot);
+  server.begin();
+}
+
+/* ================= LOOP ================= */
+void loop() {
+  dnsServer.processNextRequest();
+  server.handleClient();
+
+  if (ultrasonicEnabled && millis()-lastUltraCheck>120) {
+    lastUltraCheck=millis();
+    distanceCM=readUltrasonic();
+  }
+
+  updateMotors();
+}
+
+/* ================= MOTOR + LED LOGIC ================= */
+void updateMotors() {
+
+  bool carMoving=false;
+
+  if (ultrasonicEnabled && driveForward && distanceCM<50) {
+    ledcWrite(ena,0);
+    digitalWrite(in1,LOW); digitalWrite(in2,LOW);
+  }
+  else if (driveForward) {
+    ledcWrite(ena,motorSpeed);
+    digitalWrite(in1,HIGH); digitalWrite(in2,LOW);
+    carMoving=true;
+  }
+  else if (driveBackward) {
+    ledcWrite(ena,motorSpeed);
+    digitalWrite(in1,LOW); digitalWrite(in2,HIGH);
+    carMoving=true;
+  }
+  else {
+    ledcWrite(ena,0);
+    digitalWrite(in1,LOW); digitalWrite(in2,LOW);
+  }
+
+  if (steerLeft) {
+    ledcWrite(enb,STEER_POWER);
+    digitalWrite(in3,HIGH); digitalWrite(in4,LOW);
+  }
+  else if (steerRight) {
+    ledcWrite(enb,STEER_POWER);
+    digitalWrite(in3,LOW); digitalWrite(in4,HIGH);
+  }
+  else {
+    ledcWrite(enb,0);
+    digitalWrite(in3,LOW); digitalWrite(in4,LOW);
+  }
+
+  /* ===== LED LOGIC ===== */
+  if (policeMode) {
+    if (millis()-policeTimer>300) {
+      policeTimer=millis();
+      policeState=!policeState;
+    }
+    digitalWrite(LED_RED, policeState);
+    digitalWrite(LED_BLUE, !policeState);
+  }
+  else {
+    if (ultrasonicEnabled && driveForward && distanceCM<50) {
+      digitalWrite(LED_RED,HIGH);
+      digitalWrite(LED_BLUE,LOW);
+    }
+    else if (carMoving) {
+      digitalWrite(LED_BLUE,HIGH);
+      digitalWrite(LED_RED,LOW);
+    }
+    else {
+      digitalWrite(LED_BLUE,LOW);
+      digitalWrite(LED_RED,LOW);
+    }
+  }
+}
+
+/* ================= HELPERS ================= */
+void stopAll() {
+  ledcWrite(ena,0); ledcWrite(enb,0);
+  digitalWrite(in1,LOW); digitalWrite(in2,LOW);
+  digitalWrite(in3,LOW); digitalWrite(in4,LOW);
+  digitalWrite(LED_BLUE,LOW);
+  digitalWrite(LED_RED,LOW);
+}
+
+long readUltrasonic() {
+  digitalWrite(trigPin,LOW); delayMicroseconds(2);
+  digitalWrite(trigPin,HIGH); delayMicroseconds(10);
+  digitalWrite(trigPin,LOW);
+  long d=pulseIn(echoPin,HIGH,40000);
+  if(d==0) return 200;
+  return d*0.034/2;
+}
+
+/* ================= UI ================= */
+void handleRoot() {
+  server.send(200,"text/html",R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<style>
+*{
+  -webkit-user-select:none;
+  user-select:none;
+  -webkit-touch-callout:none;
+  touch-action:none;
+  box-sizing:border-box;
+}
+
+html,body{
+  width:100%;
+  height:100%;
+  overflow:hidden;
+}
+
+body{
+  margin:0;
+  min-height:100vh;
+  min-height:100dvh;
+  font-family:'Segoe UI',Arial;
+  background:
+    radial-gradient(circle at top, #0f2027, #000),
+    linear-gradient(90deg, rgba(0,255,255,.05) 1px, transparent 1px),
+    linear-gradient(rgba(0,255,255,.05) 1px, transparent 1px);
+  background-size:cover,40px 40px,40px 40px;
+  color:#e6faff;
+  text-align:center;
+}
+
+h2{
+  margin:18px 0;
+  letter-spacing:2px;
+  font-weight:600;
+  color:#66fcf1;
+  text-shadow:0 0 12px rgba(102,252,241,.6);
+}
+
+/* ===== CONTROL PAD ===== */
+.pad{
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  margin-top:20px;
+}
+
+.row{
+  display:flex;
+  gap:26px;
+}
+
+/* ===== BUTTONS ===== */
+button{
+  width:110px;
+  height:110px;
+  font-size:38px;
+  border-radius:24px;
+  border:1px solid rgba(0,255,255,.35);
+  background:rgba(255,255,255,.06);
+  color:#66fcf1;
+  backdrop-filter:blur(12px);
+  box-shadow:
+    inset 0 0 14px rgba(0,255,255,.25),
+    0 10px 28px rgba(0,0,0,.6);
+  transition:.15s;
+}
+
+button.active{
+  background:linear-gradient(145deg,#00e5ff,#0077ff);
+  color:#fff;
+  box-shadow:0 0 30px rgba(0,229,255,.9);
+  transform:scale(.92);
+}
+
+/* ===== SPEED ===== */
+.speedBox{
+  margin-top:30px;
+  padding:16px;
+}
+
+.speedBox p{
+  margin:6px;
+  letter-spacing:1px;
+  color:#9ffcff;
+}
+
+input[type=range]{
+  width:280px;
+  -webkit-appearance:none;
+  height:10px;
+  background:linear-gradient(90deg,#00e5ff,#0050ff);
+  border-radius:6px;
+  outline:none;
+  box-shadow:0 0 18px rgba(0,229,255,.7);
+}
+
+input::-webkit-slider-thumb{
+  -webkit-appearance:none;
+  width:26px;
+  height:26px;
+  border-radius:50%;
+  background:#fff;
+  box-shadow:0 0 18px rgba(0,255,255,1);
+}
+
+/* ===== RPM GAUGE ===== */
+.rpmBox{
+  margin-top:22px;
+  display:flex;
+  justify-content:center;
+}
+
+.rpmRing{
+  width:150px;
+  height:150px;
+  border-radius:50%;
+  background:conic-gradient(#00e5ff 0deg,#003344 0deg);
+  box-shadow:0 0 25px rgba(0,229,255,.7);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+}
+
+.rpmInner{
+  width:110px;
+  height:110px;
+  border-radius:50%;
+  background:#050c10;
+  display:flex;
+  flex-direction:column;
+  align-items:center;
+  justify-content:center;
+}
+
+.rpmVal{
+  font-size:26px;
+  font-weight:600;
+  color:#66fcf1;
+}
+
+.rpmTxt{
+  font-size:12px;
+  opacity:.7;
+}
+
+/* ===== MODES ===== */
+.modeBox{
+  margin:30px 0;
+  display:flex;
+  gap:22px;
+  justify-content:center;
+}
+
+.modeBtn{
+  width:160px;
+  height:70px;
+  font-size:18px;
+  border-radius:20px;
+  letter-spacing:1px;
+}
+
+footer{
+  font-size:12px;
+  opacity:.6;
+}
+</style>
+</head>
+
+<body>
+
+<h2>AMR CONTROLS</h2>
+
+<div class="pad">
+  <button id="F">▲</button>
+  <div class="row">
+    <button id="L">◀</button>
+    <button id="R">▶</button>
+  </div>
+  <button id="B">▼</button>
+</div>
+
+<div class="speedBox">
+  <p><b>DRIVE POWER</b></p>
+  <input type="range" min="165" max="255" value="160"
+  oninput="fetch('/speed?val='+this.value);updateRPM(this.value)">
+</div>
+
+<div class="rpmBox">
+  <div class="rpmRing" id="rpmRing">
+    <div class="rpmInner">
+      <div class="rpmVal" id="rpmVal">0</div>
+      <div class="rpmTxt">RPM</div>
+    </div>
+  </div>
+</div>
+
+<div class="modeBox">
+  <button class="modeBtn" id="U">SENSOR</button>
+  <button class="modeBtn" id="P">LIGHT'S</button>
+</div>
+
+<footer>MANSHU TIWARI</footer>
+
+<script>
+document.addEventListener("contextmenu",e=>e.preventDefault());
+
+function hold(b,on,off){
+  b.onpointerdown=e=>{
+    e.preventDefault();
+    b.classList.add("active");
+    fetch("/"+on);
+  }
+  ["pointerup","pointerleave","pointercancel"].forEach(ev=>{
+    b.addEventListener(ev,e=>{
+      b.classList.remove("active");
+      fetch("/"+off);
+    });
+  });
+}
+
+hold(F,"F_ON","F_OFF");
+hold(B,"B_ON","B_OFF");
+hold(L,"L_ON","L_OFF");
+hold(R,"R_ON","R_OFF");
+
+let u=false;
+U.onclick=()=>{
+  u=!u;
+  fetch(u?"/ultraOn":"/ultraOff");
+  U.style.background=u?"linear-gradient(145deg,#ff3b3b,#b30000)":"rgba(255,255,255,.06)";
+  U.style.color=u?"#fff":"#66fcf1";
+};
+
+let p=false;
+P.onclick=()=>{
+  p=!p;
+  fetch(p?"/policeOn":"/policeOff");
+  P.style.background=p?"linear-gradient(145deg,#0033ff,#001a66)":"rgba(255,255,255,.06)";
+  P.style.color=p?"#fff":"#66fcf1";
+};
+
+/* ===== RPM VISUAL ONLY ===== */
+function updateRPM(val){
+  let rpm = Math.round((val - 170) * (300 / 85));
+  rpm = Math.max(0,rpm);
+  let deg = (rpm/300)*270;
+  rpmRing.style.background =
+    `conic-gradient(#00e5ff ${deg}deg,#003344 ${deg}deg)`;
+  rpmVal.innerText = rpm;
+}
+
+updateRPM(document.querySelector("input[type=range]").value);
+
+window.addEventListener('beforeunload', (event) => {
+  event.preventDefault();
+  event.returnValue = ''; // Required for Chrome
+});
+
+</script>
+
+</body>
+</html>
+)rawliteral");
+}
